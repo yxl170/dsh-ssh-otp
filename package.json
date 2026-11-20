@@ -31,7 +31,8 @@
     "server/ssh_service.py",
     "config.example.json",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "scripts"
   ],
   "dsh": {
     "engines": {
@@ -47,5 +48,13 @@
   },
   "peerDependencies": {
     "react": "^18.2.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yxl170/dsh-ssh-otp.git"
+  },
+  "homepage": "https://github.com/yxl170/dsh-ssh-otp#readme",
+  "bugs": {
+    "url": "https://github.com/yxl170/dsh-ssh-otp/issues"
   }
 }

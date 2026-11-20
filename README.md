@@ -46,37 +46,60 @@ The Node half never speaks SSH. The Python half never knows where secrets came f
 
 ## Install
 
-**1. Create a dedicated Python environment**
+The plugin is a plain npm package with no build step, so it installs straight from this repository.
 
-```bash
-python -m venv ~/.dsh/runtimes/dsh-ssh-otp
-~/.dsh/runtimes/dsh-ssh-otp/bin/python -m pip install paramiko
-# Windows: ~/.dsh/runtimes/dsh-ssh-otp/Scripts/python.exe
+**1. Prepare Python once**
+
+Create the virtualenv the plugin expects by default and install `paramiko`:
+
+```powershell
+# Windows
+powershell -ExecutionPolicy Bypass -File ./scripts/setup-python.ps1
 ```
 
-**2. Place the plugin**
+```bash
+# Linux / macOS
+bash scripts/setup-python.sh
+```
 
-Put this directory at `~/.dsh/plugins/dsh-ssh-otp` (any path works, as long as the profile links to it).
+The Windows script creates `%USERPROFILE%/.dsh/runtimes/dsh-ssh-otp/Scripts/python.exe`; the Unix one creates `~/.dsh/runtimes/dsh-ssh-otp/bin/python`. Those are the plugin's built-in defaults, so no config edit is needed. To use another interpreter, set `pythonPath` in `~/.dsh/dsh-ssh-otp.json`.
 
-**3. Register it in the DSH profile**
+**2. Add the plugin in DSH**
 
-Edit `~/.dsh/profiles/<profile>/package.json`:
+**Settings → Plugins → Add plugin**, paste:
+
+```
+https://github.com/yxl170/dsh-ssh-otp
+```
+
+(`github:yxl170/dsh-ssh-otp` works too.) Install, then enable the row. No restart is needed for a fresh install.
+
+**3. Configure it**
+
+Open **Settings → Plugins → dsh-ssh-otp**:
+
+1. **新增主机** — alias, host, port, user, auth kind; credential names are derived from the alias when left empty.
+2. **保存主机**, then paste the password (and TOTP seed) into the **凭据** rows that appear and save them.
+3. **测试连接** to confirm the login works.
+
+The page writes `~/.dsh/dsh-ssh-otp.json` atomically and keeps the previous copy as `.bak`. Secrets never go into that file — they are stored in the DSH credential store.
+
+<details>
+<summary>Manual install (development checkout)</summary>
+
+Link a local checkout into the profile instead of installing from GitHub:
 
 ```jsonc
+// ~/.dsh/profiles/<profile>/package.json
 {
   "dependencies": { "dsh-ssh-otp": "link:C:/path/to/dsh-ssh-otp" },
   "dsh": { "profile": { "bundles": ["...", "dsh-ssh-otp"] } }
 }
 ```
 
-Make the directory resolvable under the profile's `node_modules` (a symlink/junction is enough):
+Then make the package resolvable under the profile's `node_modules` (a junction/symlink is enough) and restart DSH — the bundle list is read at startup only.
 
-```powershell
-New-Item -ItemType Junction -Path "$HOME\.dsh\profiles\desktop\node_modules\dsh-ssh-otp" `
-  -Target "$HOME\.dsh\plugins\dsh-ssh-otp"
-```
-
-**4. Restart DSH.** The bundle list is read at startup only.
+</details>
 
 ## Configure hosts
 
