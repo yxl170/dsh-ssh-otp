@@ -15,7 +15,7 @@ Four agent tools:
 | `ssh_otp_upload` | SFTP upload, refuses to overwrite unless `overwrite=true` |
 | `ssh_otp_download` | SFTP download, refuses to overwrite unless `overwrite=true` |
 
-Plus a small settings page under **Settings → Plugins → dsh-ssh-otp** for entering the two secrets and testing a connection.
+Plus a settings page under **Settings → Plugins → dsh-ssh-otp** that adds, edits and deletes hosts, stores the two secrets, tests a connection, and edits the default timeout. Only hosts and the timeout are writable there; `pythonPath`/`servicePath` stay file-only so the page cannot become a way to run an arbitrary interpreter. Saving writes `~/.dsh/dsh-ssh-otp.json` atomically (previous version kept as `.bak`); secrets still go only to the credential store.
 
 Behaviour worth knowing:
 
@@ -80,7 +80,9 @@ New-Item -ItemType Junction -Path "$HOME\.dsh\profiles\desktop\node_modules\dsh-
 
 ## Configure hosts
 
-Copy `config.example.json` to `~/.dsh/dsh-ssh-otp.json` and edit:
+Easiest path: add a host on the settings page — alias, address, port, user, auth kind, and the two credential names (leave them empty and they are derived from the alias). The page writes the config for you.
+
+To do it by hand, copy `config.example.json` to `~/.dsh/dsh-ssh-otp.json` and edit:
 
 ```jsonc
 {
@@ -164,6 +166,6 @@ MIT
 
 这个插件给 DSH 加上能**自动完成「密码 + 动态验证码」二次验证登录**的 SSH 工具，用于那些禁用了公钥认证、每次连接都要求 `keyboard-interactive` 验证码的集群。
 
-提供 `ssh_otp_hosts` / `ssh_otp_exec` / `ssh_otp_upload` / `ssh_otp_download` 四个工具，外加一个设置页录入密钥。
+提供 `ssh_otp_hosts` / `ssh_otp_exec` / `ssh_otp_upload` / `ssh_otp_download` 四个工具，外加一个设置页：增删改主机、录入密钥、测试连接、修改默认超时（解释器与服务脚本路径只读）。
 
 **安全前提必须清楚**：把密码和 TOTP 种子都存在同一台机器上，等于把双因子降成单因子。种子就是母本，谁拿到它就能一直生成有效验证码。插件能做的是"不再把明文写进配置、日志和报错里"，做不到"泄露后仍然安全"。种子一旦外泄，请立刻在服务器上重置二次验证密钥。

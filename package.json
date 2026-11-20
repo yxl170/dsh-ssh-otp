@@ -1,6 +1,6 @@
 {
   "name": "dsh-ssh-otp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": false,
   "description": "DeepSeek Harness plugin: SSH tools that complete password + TOTP two-factor login non-interactively (for clusters where publickey auth is disabled)",
   "license": "MIT",

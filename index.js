@@ -9,7 +9,7 @@
  *   Node 侧只做协议编排、凭据解析与输出整形。
  */
 import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -58,6 +58,90 @@ function loadConfig(logger) {
   } catch (error) {
     logger?.warn?.(`ssh-otp: 配置文件解析失败，按空配置处理：${String(error?.message ?? error)}`)
     return { ...DEFAULTS, hosts: {} }
+  }
+}
+
+/** 配置编辑：校验 + 原子落盘（设置页的「编辑配置 / 新增主机」走这里） */
+const REF_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/
+const ALIAS_RE = /^[A-Za-z0-9_.-]{1,64}$/
+
+function deriveRef(alias, suffix) {
+  const base = String(alias).replace(/[^A-Za-z0-9_]/g, '_')
+  const safe = /^[A-Za-z_]/.test(base) ? base.toUpperCase() : `HOST_${base.toUpperCase()}`
+  return `${safe}_${suffix}`
+}
+
+function normalizeHosts(rawHosts) {
+  if (!Array.isArray(rawHosts)) throw new Error('hosts 必须是数组')
+  if (rawHosts.length > 50) throw new Error('最多配置 50 台主机')
+  const seen = new Set()
+  const hosts = {}
+  rawHosts.forEach((item, index) => {
+    const where = `第 ${index + 1} 台主机`
+    if (item === null || typeof item !== 'object' || Array.isArray(item)) throw new Error(`${where}格式不对`)
+    const alias = String(item.alias ?? '').trim()
+    if (!ALIAS_RE.test(alias)) throw new Error(`${where}：别名只能用字母、数字、下划线、点、短横线（1–64 个字符）`)
+    if (seen.has(alias)) throw new Error(`别名重复：${alias}`)
+    seen.add(alias)
+    const host = String(item.host ?? '').trim()
+    if (host === '' || /\s/.test(host)) throw new Error(`${alias}：主机地址不能为空，也不能包含空白`)
+    const portRaw = item.port === undefined || item.port === null || item.port === '' ? 22 : Number(item.port)
+    if (!Number.isInteger(portRaw) || portRaw < 1 || portRaw > 65535) throw new Error(`${alias}：端口必须是 1–65535 的整数`)
+    const user = String(item.user ?? '').trim()
+    if (user === '' || /\s/.test(user)) throw new Error(`${alias}：用户名不能为空，也不能包含空白`)
+    const authKind = item.authKind === 'password_totp' ? 'password_totp' : 'password'
+    const passwordRef = String(item.passwordRef ?? '').trim() || deriveRef(alias, 'SSH_PASSWORD')
+    if (!REF_RE.test(passwordRef)) throw new Error(`${alias}：密码凭据名不合法（字母或下划线开头，只用字母数字下划线）`)
+    const auth = { kind: authKind, passwordRef }
+    if (authKind === 'password_totp') {
+      const totpRef = String(item.totpRef ?? '').trim() || deriveRef(alias, 'TOTP_SEED')
+      if (!REF_RE.test(totpRef)) throw new Error(`${alias}：TOTP 凭据名不合法（字母或下划线开头，只用字母数字下划线）`)
+      if (totpRef === passwordRef) throw new Error(`${alias}：密码与 TOTP 不能共用同一个凭据名`)
+      auth.totpRef = totpRef
+    }
+    hosts[alias] = { host, port: portRaw, user, auth }
+  })
+  return hosts
+}
+
+function buildNextConfig(current, patch) {
+  const next = { ...current }
+  for (const key of Object.keys(patch)) {
+    if (key !== 'hosts' && key !== 'timeoutMs') throw new Error('设置页只允许修改主机连接和默认超时')
+  }
+  if (patch.timeoutMs !== undefined) {
+    const value = Number(patch.timeoutMs)
+    if (!Number.isInteger(value) || value < 1000 || value > 3600000) throw new Error('默认超时必须在 1000–3600000 毫秒之间')
+    next.timeoutMs = value
+  }
+  if (patch.hosts !== undefined) next.hosts = normalizeHosts(patch.hosts)
+  return next
+}
+
+function saveConfigFile(next) {
+  const text = `${JSON.stringify(next, null, 2)}\n`
+  const tmp = `${CONFIG_FILE}.tmp-${process.pid}`
+  writeFileSync(tmp, text, 'utf8')
+  if (existsSync(CONFIG_FILE)) writeFileSync(`${CONFIG_FILE}.bak`, readFileSync(CONFIG_FILE))
+  renameSync(tmp, CONFIG_FILE)
+}
+
+function describeConfig(logger) {
+  const config = loadConfig(logger)
+  return {
+    pythonPath: config.pythonPath,
+    servicePath: config.servicePath,
+    idleMinutes: config.idleMinutes,
+    timeoutMs: config.timeoutMs,
+    hosts: Object.entries(config.hosts ?? {}).map(([alias, host]) => ({
+      alias,
+      host: host.host,
+      port: host.port ?? 22,
+      user: host.user,
+      authKind: host.auth?.kind ?? 'password',
+      passwordRef: host.auth?.passwordRef ?? '',
+      totpRef: host.auth?.totpRef ?? '',
+    })),
   }
 }
 
@@ -279,7 +363,24 @@ export function apply(ctx, _config) {
     const host = String(req.headers?.host ?? '')
     const addressOk = address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1'
     const hostOk = /^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i.test(host)
-    return addressOk && hostOk
+    if (!addressOk || !hostOk) return false
+    if (req.method !== 'POST') return true
+    // A loopback destination alone does not establish the requesting page's origin.
+    const site = req.headers?.['sec-fetch-site']
+    if (site && site !== 'same-origin' && site !== 'none') return false
+    if (!/^application\/json(?:\s*;|$)/i.test(req.headers?.['content-type'] ?? '')) return false
+    const origin = req.headers?.origin
+    if (origin === undefined) return true
+    try {
+      const url = new URL(origin)
+      const port = String(url.port || (url.protocol === 'https:' ? 443 : 80))
+      const hostPort = /:(\d+)$/.exec(host)?.[1] ?? '80'
+      return (url.protocol === 'http:' || url.protocol === 'https:') &&
+        (url.hostname === '127.0.0.1' || url.hostname === 'localhost' || url.hostname === '[::1]') &&
+        port === hostPort
+    } catch {
+      return false
+    }
   }
 
   function sendJson(res, status, body) {
@@ -319,6 +420,32 @@ export function apply(ctx, _config) {
     }
 
     const routes = [
+      {
+        kind: 'exact',
+        path: '/plugins/dsh-ssh-otp/config',
+        handler: async (req, res) => {
+          if (!isLoopback(req)) return sendJson(res, 403, { error: 'forbidden: loopback-only' })
+          if (req.method === 'GET') {
+            try {
+              return sendJson(res, 200, { config: describeConfig(logger), configPath: CONFIG_FILE })
+            } catch (error) {
+              return sendJson(res, 500, { error: String(error?.message ?? error) })
+            }
+          }
+          if (req.method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' })
+          try {
+            const body = await readJsonBody(req)
+            if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+              return sendJson(res, 400, { error: '请求体必须是 JSON 对象' })
+            }
+            const next = buildNextConfig(loadConfig(logger), body)
+            saveConfigFile(next)
+            sendJson(res, 200, { ok: true, config: describeConfig(logger), configPath: CONFIG_FILE })
+          } catch (error) {
+            sendJson(res, 400, { error: String(error?.message ?? error) })
+          }
+        },
+      },
       {
         kind: 'exact',
         path: '/plugins/dsh-ssh-otp/state',
