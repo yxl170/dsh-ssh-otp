@@ -1,0 +1,19 @@
+# 本地依赖与构建产物
+node_modules/
+*.log
+
+# 本地配置（含主机地址、用户名等环境信息，不随仓库分发）
+dsh-ssh-otp.json
+
+# 凭据与落盘输出
+.credentials.yaml
+*.credentials.yaml
+ssh-otp-spill/
+*.bak
+*.bak.*
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

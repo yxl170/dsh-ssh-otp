@@ -1,0 +1,27 @@
+{
+  "pythonPath": "~/.dsh/runtimes/dsh-ssh-otp/Scripts/python.exe",
+  "servicePath": "~/.dsh/plugins/dsh-ssh-otp/server/ssh_service.py",
+  "idleMinutes": 10,
+  "timeoutMs": 120000,
+  "hosts": {
+    "cluster-a": {
+      "host": "cluster.example.org",
+      "port": 22,
+      "user": "your-username",
+      "auth": {
+        "kind": "password_totp",
+        "passwordRef": "CLUSTER_A_SSH_PASSWORD",
+        "totpRef": "CLUSTER_A_TOTP_SEED"
+      }
+    },
+    "cluster-b": {
+      "host": "10.0.0.10",
+      "port": 22,
+      "user": "your-username",
+      "auth": {
+        "kind": "password",
+        "passwordRef": "CLUSTER_B_SSH_PASSWORD"
+      }
+    }
+  }
+}

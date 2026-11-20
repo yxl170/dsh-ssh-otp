@@ -1,0 +1,51 @@
+{
+  "name": "dsh-ssh-otp",
+  "version": "0.1.0",
+  "private": false,
+  "description": "DeepSeek Harness plugin: SSH tools that complete password + TOTP two-factor login non-interactively (for clusters where publickey auth is disabled)",
+  "license": "MIT",
+  "type": "module",
+  "main": "index.js",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "ssh",
+    "totp",
+    "2fa",
+    "keyboard-interactive",
+    "paramiko"
+  ],
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "server/ssh_service.py",
+    "config.example.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "engines": {
+      "dsh": ">=0.2.2-rc.3"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
+    }
+  },
+  "peerDependencies": {
+    "react": "^18.2.0"
+  }
+}
