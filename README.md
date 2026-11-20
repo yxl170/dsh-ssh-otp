@@ -50,19 +50,21 @@ The plugin is a plain npm package with no build step, so it installs straight fr
 
 **1. Prepare Python once**
 
-Create the virtualenv the plugin expects by default and install `paramiko`:
+Create the virtualenv the plugin expects by default and install `paramiko` — no clone required:
 
 ```powershell
-# Windows
-powershell -ExecutionPolicy Bypass -File ./scripts/setup-python.ps1
+# Windows (PowerShell)
+$s = "$env:TEMP\dsh-ssh-otp-setup.ps1"
+irm https://raw.githubusercontent.com/yxl170/dsh-ssh-otp/main/scripts/setup-python.ps1 -OutFile $s
+powershell -ExecutionPolicy Bypass -File $s
 ```
 
 ```bash
 # Linux / macOS
-bash scripts/setup-python.sh
+curl -fsSL https://raw.githubusercontent.com/yxl170/dsh-ssh-otp/main/scripts/setup-python.sh | bash
 ```
 
-The Windows script creates `%USERPROFILE%/.dsh/runtimes/dsh-ssh-otp/Scripts/python.exe`; the Unix one creates `~/.dsh/runtimes/dsh-ssh-otp/bin/python`. Those are the plugin's built-in defaults, so no config edit is needed. To use another interpreter, set `pythonPath` in `~/.dsh/dsh-ssh-otp.json`.
+The Windows script creates `%USERPROFILE%/.dsh/runtimes/dsh-ssh-otp/Scripts/python.exe`; the Unix one creates `~/.dsh/runtimes/dsh-ssh-otp/bin/python`. Those are the plugin's built-in defaults, so no config edit is needed. Without this step the first connection fails with "找不到 Python 解释器".
 
 **2. Add the plugin in DSH**
 
