@@ -82,6 +82,42 @@ def wait_next_window(seconds_max=AUTH_WAIT_MAX):
     return True
 
 
+MAX_PROMPT_CHARS = 60
+
+
+def sanitize_prompt(prompt):
+    """提示文本只保留可读字符，绝不回传任何输入值。"""
+    text = ' '.join(str(prompt or '').split())
+    return text[:MAX_PROMPT_CHARS]
+
+
+def format_auth_failure(prompts, attempts):
+    if not prompts:
+        head = '认证失败：服务器没有下发可识别的交互提示。'
+    else:
+        seq = ' → '.join(
+            '%s→%s' % (p['prompt'] or '(空提示)', 'TOTP' if p['kind'] == 'totp' else 'PASSWORD')
+            for p in prompts
+        )
+        head = '认证失败：服务器提示序列 [%s]' % seq
+    count = '（本次尝试 %d 次）' % attempts
+    kinds = {p['kind'] for p in prompts}
+    if not kinds or kinds == {'password'}:
+        hint = '提示：只出现 Password 轮次时，通常是用户名或密码不正确。'
+    else:
+        hint = '提示：验证码轮次被拒时请核对 TOTP seed 与服务器时间；用户名/密码错误也会得到同样的失败结果。'
+    return '%s%s\n%s' % (head, count, hint)
+
+
+class AuthFailed(Exception):
+    """认证失败：带服务器提示序列（无凭据值），供上层决定是否重试与如何提示。"""
+
+    def __init__(self, prompts, attempts):
+        super().__init__(format_auth_failure(prompts, attempts))
+        self.prompts = prompts
+        self.attempts = attempts
+
+
 # ---------------------------------------------------------------- 连接
 
 class Connection:
@@ -91,6 +127,7 @@ class Connection:
         self.transport = None
         self.sftp = None
         self.last_used = 0.0
+        self.retry_on_auth_failure = False
 
     # -- 建立连接 -------------------------------------------------
     def _open_transport(self):
@@ -99,35 +136,52 @@ class Connection:
         password = auth.get('password') or ''
         seed = auth.get('totp_seed') or ''
 
+        prompts_seen = []
+
         def handler(title, instructions, prompts):
             answers = []
             for prompt, _echo in prompts:
-                if re.search(r'code|verif|otp|token|验证码', prompt, re.I):
-                    answers.append(totp(seed))
-                else:
-                    answers.append(password)
+                kind_of_prompt = 'totp' if re.search(r'code|verif|otp|token|验证码', prompt, re.I) else 'password'
+                prompts_seen.append({'prompt': sanitize_prompt(prompt), 'kind': kind_of_prompt})
+                answers.append(totp(seed) if kind_of_prompt == 'totp' else password)
             return answers
 
-        transport = paramiko.Transport((self.spec['host'], int(self.spec.get('port') or 22)))
-        transport.connect()
-        try:
-            if kind == 'password_totp':
-                transport.auth_interactive(self.spec['user'], handler)
-            else:
-                transport.auth_password(self.spec['user'], password)
-        except paramiko.AuthenticationException:
-            # 2FA 防重放：换到下一个 30 秒窗口再试一次
-            transport.close()
-            if kind == 'password_totp' and wait_next_window():
-                log('认证失败，已等待下一个验证码窗口后重试')
-                transport = paramiko.Transport((self.spec['host'], int(self.spec.get('port') or 22)))
-                transport.connect()
-                transport.auth_interactive(self.spec['user'], handler)
-            else:
+        def connect_once():
+            transport = paramiko.Transport((self.spec['host'], int(self.spec.get('port') or 22)))
+            transport.connect()
+            try:
+                if kind == 'password_totp':
+                    transport.auth_interactive(self.spec['user'], handler)
+                else:
+                    transport.auth_password(self.spec['user'], password)
+            except paramiko.AuthenticationException:
+                transport.close()
                 raise
-        if not transport.is_authenticated():
-            transport.close()
-            raise paramiko.AuthenticationException('认证未通过')
+            if not transport.is_authenticated():
+                transport.close()
+                raise paramiko.AuthenticationException('认证未通过')
+            return transport
+
+        attempts = 0
+        try:
+            attempts += 1
+            transport = connect_once()
+        except paramiko.AuthenticationException:
+            # 默认不重试：用户名/密码错误时重试毫无作用，还会把 fail2ban 计数翻倍。
+            # 只有显式开启重试、且本次确实出现过验证码轮次时才等下一个窗口再试一次。
+            has_totp_round = any(item['kind'] == 'totp' for item in prompts_seen)
+            may_retry = self.retry_on_auth_failure and kind == 'password_totp' and has_totp_round
+            if not may_retry:
+                raise AuthFailed(prompts_seen, attempts)
+            if not wait_next_window():
+                raise AuthFailed(prompts_seen, attempts)
+            log('认证失败（已开启 retryOnAuthFailure），等待下一个验证码窗口后重试一次')
+            prompts_seen = []
+            attempts += 1
+            try:
+                transport = connect_once()
+            except paramiko.AuthenticationException:
+                raise AuthFailed(prompts_seen, attempts)
         log('已连接 %s (%s@%s)' % (self.alias, self.spec['user'], self.spec['host']))
         return transport
 
@@ -342,6 +396,7 @@ def handle(request):
         raise ValueError('缺少 alias 或 conn')
 
     conn = get_connection(alias, spec)
+    conn.retry_on_auth_failure = bool(request.get('retryOnAuthFailure'))
 
     if op == 'exec':
         return conn.exec(request.get('command') or '', request.get('timeoutMs'))
@@ -377,6 +432,15 @@ def main():
                 with lock_for(alias or '__all__'):
                     payload = handle(request)
             payload.update({'id': req_id, 'ok': True})
+        except AuthFailed as error:
+            payload = {
+                'id': req_id,
+                'ok': False,
+                'error': str(error),
+                'code': 'AUTH_FAILED',
+                'attempts': error.attempts,
+                'prompts': error.prompts,
+            }
         except FileExistsError as error:
             payload = {'id': req_id, 'ok': False, 'error': str(error), 'code': 'EEXIST'}
         except FileNotFoundError as error:

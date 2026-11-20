@@ -8,8 +8,8 @@
  * - SSH 由子进程里的 paramiko 负责（走 keyboard-interactive，能应答动态验证码），
  *   Node 侧只做协议编排、凭据解析与输出整形。
  */
-import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { spawn, spawnSync } from 'node:child_process'
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -28,11 +28,132 @@ const INLINE_HEAD_CHARS = 32 * 1024
 const DEFAULT_TIMEOUT_MS = 120000
 
 const DEFAULTS = {
-  pythonPath: join(DSH_HOME, 'runtimes', 'dsh-ssh-otp', 'Scripts', 'python.exe'),
+  pythonPath: '',
   servicePath: join(PLUGIN_DIR, 'server', 'ssh_service.py'),
   idleMinutes: 10,
   timeoutMs: DEFAULT_TIMEOUT_MS,
+  retryOnAuthFailure: false,
   hosts: {},
+}
+
+/** 解释器探测：显式配置优先；缺失时依次尝试 DSH 受管运行时、插件默认 venv、PATH */
+const PYTHON_PROBE_TIMEOUT_MS = 8000
+const PYTHON_CACHE_MS = 30_000
+let pythonResolutionCache = null
+
+const isWindows = process.platform === 'win32'
+
+function venvPython(root) {
+  return isWindows ? join(root, 'Scripts', 'python.exe') : join(root, 'bin', 'python')
+}
+
+function managedPythonCandidates() {
+  const base = join(DSH_HOME, 'dsh-runtimes')
+  const found = []
+  try {
+    for (const entry of readdirSync(base)) {
+      const candidate = isWindows
+        ? join(base, entry, 'dependencies', 'python', 'python.exe')
+        : join(base, entry, 'dependencies', 'python', 'bin', 'python3')
+      if (existsSync(candidate)) found.push(candidate)
+    }
+  } catch {
+    /* 没有 dsh-runtimes 目录 */
+  }
+  return found
+}
+
+function probePython(path) {
+  const result = spawnSync(path, ['-c', 'import paramiko'], { timeout: PYTHON_PROBE_TIMEOUT_MS, windowsHide: true })
+  if (result.error) return 'missing'
+  if (result.status === 0) return 'ok'
+  const stderr = String(result.stderr ?? '')
+  if (/No module named ['"]?paramiko/i.test(stderr)) return 'missing-paramiko'
+  return 'broken'
+}
+
+function setupCommand() {
+  return isWindows
+    ? `powershell -ExecutionPolicy Bypass -File "${join(PLUGIN_DIR, 'scripts', 'setup-python.ps1')}"`
+    : `bash "${join(PLUGIN_DIR, 'scripts', 'setup-python.sh')}"`
+}
+
+function pythonError(tried, hasParamikoGap) {
+  const lines = ['找不到可用的 Python 解释器。', '已尝试：']
+  for (const item of tried) lines.push(`  - ${item}`)
+  if (hasParamikoGap) {
+    lines.push('', '其中有的解释器能运行但缺少 paramiko：执行下面的初始化脚本会创建专用 venv 并装好依赖。')
+  } else {
+    lines.push('', '执行下面的初始化脚本会创建专用 venv 并安装 paramiko：')
+  }
+  lines.push(`  ${setupCommand()}`)
+  lines.push('', '也可以用环境变量 DSH_SSH_OTP_PYTHON 指定解释器；或在 ~/.dsh/dsh-ssh-otp.json 里填写 pythonPath。')
+  return new Error(lines.join('\n'))
+}
+
+/**
+ * 解析本次调用要用的 Python。
+ * @returns {{path: string, source: string} | null} null 表示需要临时探测（供 describeConfig 使用不抛错的版本由调用方捕获）
+ */
+function resolvePython(config, logger) {
+  const now = Date.now()
+  const key = `${config.pythonPath ?? ''}|${process.env.DSH_SSH_OTP_PYTHON ?? ''}`
+  if (pythonResolutionCache !== null && pythonResolutionCache.key === key && now - pythonResolutionCache.at < PYTHON_CACHE_MS) {
+    return pythonResolutionCache.value
+  }
+
+  const tried = []
+  const explicit = []
+  if (process.env.DSH_SSH_OTP_PYTHON) explicit.push({ path: process.env.DSH_SSH_OTP_PYTHON, label: 'DSH_SSH_OTP_PYTHON', strict: true })
+  if (config.pythonPath) explicit.push({ path: config.pythonPath, label: 'pythonPath', strict: false })
+
+  for (const item of explicit) {
+    if (!existsSync(item.path)) {
+      tried.push(`${item.label}：${item.path}（不存在）`)
+      if (item.strict) throw pythonError(tried, false)
+      continue
+    }
+    const probe = probePython(item.path)
+    if (probe === 'ok') {
+      const value = { path: item.path, source: item.label }
+      pythonResolutionCache = { key, at: now, value }
+      return value
+    }
+    if (probe === 'missing-paramiko') {
+      tried.push(`${item.label}：${item.path}（缺少 paramiko）`)
+      throw pythonError(tried, true)
+    }
+    tried.push(`${item.label}：${item.path}（无法执行）`)
+    if (item.strict) throw pythonError(tried, false)
+  }
+
+  const candidates = [
+    ...managedPythonCandidates().map((path) => ({ path, label: 'DSH 自带运行时' })),
+    { path: venvPython(join(DSH_HOME, 'runtimes', 'dsh-ssh-otp')), label: '插件默认 venv' },
+  ]
+  for (const name of ['python3', 'python']) {
+    const found = spawnSync(isWindows ? 'where' : 'which', [name], { windowsHide: true })
+    if (found.status === 0) {
+      const path = String(found.stdout ?? '').split(/\r?\n/)[0].trim()
+      if (path !== '') candidates.push({ path, label: `PATH ${name}` })
+    }
+  }
+
+  let paramikoGap = false
+  for (const candidate of candidates) {
+    if (!existsSync(candidate.path)) continue
+    const probe = probePython(candidate.path)
+    if (probe === 'ok') {
+      logger?.info?.(`ssh-otp: pythonPath 未配置或不可用，改用 ${candidate.label}：${candidate.path}`)
+      const value = { path: candidate.path, source: candidate.label }
+      pythonResolutionCache = { key, at: now, value }
+      return value
+    }
+    if (probe === 'missing-paramiko') paramikoGap = true
+    tried.push(`${candidate.label}：${candidate.path}（${probe === 'missing-paramiko' ? '缺少 paramiko' : '无法执行'}）`)
+  }
+
+  throw pythonError(tried, paramikoGap)
 }
 
 /** 凭据名直通：名称合法性由宿主凭据库负责，插件不依赖 @deepseek-ai/dsh-credentials */
@@ -128,8 +249,18 @@ function saveConfigFile(next) {
 
 function describeConfig(logger) {
   const config = loadConfig(logger)
+  let python = null
+  let pythonIssue = null
+  try {
+    python = resolvePython(config, logger)
+  } catch (error) {
+    pythonIssue = String(error?.message ?? error)
+  }
   return {
     pythonPath: config.pythonPath,
+    pythonResolved: python?.path ?? null,
+    pythonSource: python?.source ?? null,
+    pythonIssue,
     servicePath: config.servicePath,
     idleMinutes: config.idleMinutes,
     timeoutMs: config.timeoutMs,
@@ -188,13 +319,11 @@ class SshBridge {
   ensureStarted() {
     if (this.child && this.child.exitCode === null) return
     const config = this.getConfig()
-    if (!existsSync(config.pythonPath)) {
-      throw new Error(`找不到 Python 解释器：${config.pythonPath}（请检查 ${CONFIG_FILE} 的 pythonPath）`)
-    }
+    const python = resolvePython(config, this.logger)
     if (!existsSync(config.servicePath)) {
-      throw new Error(`找不到服务脚本：${config.servicePath}`)
+      throw new Error(`找不到服务脚本：${config.servicePath}（插件包可能不完整，请重新安装）`)
     }
-    const child = spawn(config.pythonPath, [config.servicePath], {
+    const child = spawn(python.path, [config.servicePath], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUNBUFFERED: '1' },
       windowsHide: true,
@@ -242,6 +371,8 @@ class SshBridge {
     else {
       const error = new Error(message.error ?? 'SSH 服务返回失败')
       error.code = message.code
+      if (typeof message.attempts === 'number') error.attempts = message.attempts
+      if (Array.isArray(message.prompts)) error.prompts = message.prompts
       entry.reject(error)
     }
   }
@@ -276,6 +407,42 @@ class SshBridge {
 export function apply(ctx, _config) {
   const logger = ctx.logger
   const bridge = new SshBridge(() => loadConfig(logger), logger)
+
+  /** 认证失败闸门：fail2ban 通常 maxretry=3，连续 2 次就本地刹车，避免把封禁越刷越长 */
+  const AUTH_FAILURE_WINDOW_MS = 10 * 60 * 1000
+  const authFailures = new Map()
+
+  function assertAuthAllowed(alias) {
+    const record = authFailures.get(alias)
+    if (record === undefined) return
+    if (Date.now() - record.at > AUTH_FAILURE_WINDOW_MS) {
+      authFailures.delete(alias)
+      return
+    }
+    if (record.attempts >= 2) {
+      throw new Error(`疑似触发服务器 fail2ban：主机 ${alias} 已连续 ${record.attempts} 次认证失败，请等待约 10 分钟，并先核对用户名、密码与 TOTP seed。`)
+    }
+  }
+
+  function noteAuthFailure(alias, attempts) {
+    const record = authFailures.get(alias)
+    const fresh = record !== undefined && Date.now() - record.at <= AUTH_FAILURE_WINDOW_MS
+    authFailures.set(alias, { attempts: Math.max(1, attempts) + (fresh ? record.attempts : 0), at: Date.now() })
+  }
+
+  /** 统一入口：过闸门、透传重试开关、记录失败次数 */
+  async function requestSsh(payload) {
+    assertAuthAllowed(payload.alias)
+    const retryOnAuthFailure = loadConfig(logger).retryOnAuthFailure === true
+    try {
+      const result = await bridge.request({ ...payload, retryOnAuthFailure })
+      authFailures.delete(payload.alias)
+      return result
+    } catch (error) {
+      if (error?.code === 'AUTH_FAILED') noteAuthFailure(payload.alias, Number(error.attempts) || 1)
+      throw error
+    }
+  }
 
   ctx.effect(() => () => bridge.dispose(), 'ssh-otp: bridge')
 
@@ -506,7 +673,7 @@ export function apply(ctx, _config) {
             const alias = String(body?.alias ?? '')
             if (alias === '') return sendJson(res, 400, { error: '缺少 alias' })
             const { conn } = await resolveConn(alias)
-            const payload = await bridge.request({
+            const payload = await requestSsh({
               op: 'exec',
               alias,
               conn,
@@ -634,7 +801,7 @@ export function apply(ctx, _config) {
     async execute(args, exec) {
       requireArgs(args, ['host', 'command'])
       const { conn, timeoutMs } = await resolveConn(args.host)
-      const payload = await bridge.request({
+      const payload = await requestSsh({
         op: 'exec',
         alias: args.host,
         conn,
@@ -690,7 +857,7 @@ export function apply(ctx, _config) {
       const local = resolveLocalPath(args.localPath)
       if (!existsSync(local)) throw new Error(`本机文件不存在：${local}`)
       const { conn } = await resolveConn(args.host)
-      const payload = await bridge.request({
+      const payload = await requestSsh({
         op: 'upload',
         alias: args.host,
         conn,
@@ -733,7 +900,7 @@ export function apply(ctx, _config) {
       requireArgs(args, ['host', 'remotePath', 'localPath'])
       const local = resolveLocalPath(args.localPath)
       const { conn } = await resolveConn(args.host)
-      const payload = await bridge.request({
+      const payload = await requestSsh({
         op: 'download',
         alias: args.host,
         conn,

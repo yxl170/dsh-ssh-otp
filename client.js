@@ -205,6 +205,8 @@ window.__ModuleLoader__.load({
         if (advanced !== null || config === null) return
         setAdvanced({
           pythonPath: config.pythonPath || '',
+          pythonResolved: config.pythonResolved || '',
+          pythonIssue: config.pythonIssue || '',
           servicePath: config.servicePath || '',
           idleMinutes: String(config.idleMinutes ?? 10),
           timeoutMs: String(config.timeoutMs ?? 120000),
@@ -344,8 +346,11 @@ window.__ModuleLoader__.load({
         advanced === null
           ? h('div', { style: css.muted }, '展开查看')
           : h('div', { style: { ...css.form, marginTop: '8px' } },
-            h('span', null, 'Python 解释器（只读）'), h('code', null, advanced.pythonPath),
+            h('span', null, 'Python 解释器'), h('code', null, advanced.pythonResolved || advanced.pythonPath || '（自动探测，尚未找到）'),
             h('span', null, '服务脚本（只读）'), h('code', null, advanced.servicePath),
+            advanced.pythonIssue
+              ? h('div', { style: { gridColumn: '1 / -1', color: 'var(--dsw-alias-text-warning, #c47f17)', whiteSpace: 'pre-wrap' } }, advanced.pythonIssue)
+              : null,
             h('label', { style: css.label }, '默认超时（毫秒）'),
             h('input', { value: advanced.timeoutMs, disabled: busyNow, onChange: (e) => editAdvanced('timeoutMs', e.target.value), style: css.input }),
             h('div', { style: { gridColumn: '1 / -1', ...css.actions } },

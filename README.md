@@ -20,7 +20,7 @@ Plus a settings page under **Settings → Plugins → dsh-ssh-otp** that adds, e
 Behaviour worth knowing:
 
 - **One long-lived connection per host.** Commands on the same host are serialized; different hosts run in parallel. Connections idle out after 10 minutes (configurable).
-- **Replay protection handled.** TOTP codes are single-use on most servers. If authentication is rejected, the service waits for the next 30-second window and retries exactly once.
+- **No automatic auth retry.** A rejected login is reported after exactly one attempt, because most failures are a wrong username or password and a retry only doubles the fail2ban counter. Set `"retryOnAuthFailure": true` in `~/.dsh/dsh-ssh-otp.json` if you really want one extra attempt in the next TOTP window (only when a code prompt was involved). Two consecutive failures make the plugin stop connecting for 10 minutes instead of hammering the server.
 - **Output is bounded honestly.** Anything over 64 KiB is spilled to disk and the result reports `truncated: true` plus a path holding the complete stream (`~/.dsh/ssh-otp-spill/`, or the service temp spool for very large streams). Earlier builds could stop reading while a fast producer was still writing; the read loop now waits for channel EOF before it reports totals.
 - **Secrets never touch disk here.** They are read from the DSH credential store at call time and handed to the Python child process over its stdin pipe.
 
@@ -42,7 +42,7 @@ The Node half never speaks SSH. The Python half never knows where secrets came f
 
 - DSH `>= 0.2.2-rc.3`
 - Node `>= 24`
-- Python `>= 3.10` with `paramiko`
+- Python `>= 3.10` with `paramiko` — prefer **3.11+**. Python 3.10.0 ships OpenSSL 1.1.1, whose TLS stack cannot reach PyPI, so `pip install paramiko` fails during setup; the setup script detects this and tells you instead of dumping an SSL traceback.
 
 ## Install
 
@@ -64,7 +64,9 @@ powershell -ExecutionPolicy Bypass -File $s
 curl -fsSL https://raw.githubusercontent.com/yxl170/dsh-ssh-otp/main/scripts/setup-python.sh | bash
 ```
 
-The Windows script creates `%USERPROFILE%/.dsh/runtimes/dsh-ssh-otp/Scripts/python.exe`; the Unix one creates `~/.dsh/runtimes/dsh-ssh-otp/bin/python`. Those are the plugin's built-in defaults, so no config edit is needed. Without this step the first connection fails with "找不到 Python 解释器".
+The Windows script creates `%USERPROFILE%/.dsh/runtimes/dsh-ssh-otp/Scripts/python.exe`; the Unix one creates `~/.dsh/runtimes/dsh-ssh-otp/bin/python`. The script probes candidate interpreters (including DSH's bundled runtime under `~/.dsh/dsh-runtimes/*/dependencies/python/`) and checks PyPI TLS before building the venv, so an old interpreter fails with a readable reason instead of an OpenSSL traceback.
+
+You can also skip the script and point the plugin at any interpreter that already has `paramiko`; see **Troubleshooting** below.
 
 **2. Add the plugin in DSH**
 
@@ -149,6 +151,14 @@ Two traps, both verified against the credential store implementation:
 
 1. **Quote every value.** An unquoted numeric password is parsed as a YAML number and rejected.
 2. **Validation is all-or-nothing.** A single invalid entry rejects the whole file, which also invalidates every unrelated credential in it.
+
+## Troubleshooting
+
+**“找不到可用的 Python 解释器”** — the plugin probes, in order: `DSH_SSH_OTP_PYTHON`, `pythonPath` from the config, DSH's bundled runtime, the default venv, then `python3`/`python` on `PATH`. The error lists every candidate it tried and prints the setup command for your platform. Run that command once, or set `pythonPath` to an interpreter that can `import paramiko`.
+
+**“疑似触发服务器 fail2ban”** — two consecutive auth failures within 10 minutes trip a local breaker; the plugin refuses to connect for 10 minutes instead of extending the ban. Check the username (the SSH login name, not necessarily what `whoami` prints later), the password, and the TOTP seed. The error from the failed attempt also shows the server's prompt sequence, e.g. `[Verification code:→TOTP, Password:→PASSWORD]`; a single `Password` round usually means the username or password is wrong.
+
+**Deliberate escape hatch** — `"retryOnAuthFailure": true` in `~/.dsh/dsh-ssh-otp.json` allows one extra attempt after a rejected TOTP code. Only enable it when you accept the extra failed attempt in the server's counter.
 
 ## Security model
 

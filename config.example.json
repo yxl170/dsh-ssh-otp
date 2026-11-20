@@ -23,5 +23,6 @@
         "passwordRef": "CLUSTER_B_SSH_PASSWORD"
       }
     }
-  }
+  },
+  "retryOnAuthFailure": false
 }

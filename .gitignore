@@ -17,3 +17,7 @@ ssh-otp-spill/
 Thumbs.db
 .vscode/
 .idea/
+
+# Python 缓存
+__pycache__/
+*.pyc
