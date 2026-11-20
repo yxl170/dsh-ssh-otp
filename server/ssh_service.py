@@ -173,27 +173,32 @@ class Connection:
 
         out = bytearray()
         err = bytearray()
-        out_total = err_total = 0
+        totals = {'stdout': 0, 'stderr': 0}
+        spills = {'stdout': None, 'stderr': None}  # stream -> (path, handle)
         timed_out = False
 
+        def feed(stream, chunk):
+            """内联部分只留头部；一旦超出上限，就把完整内容写进临时文件。"""
+            totals[stream] += len(chunk)
+            entry = spills[stream]
+            if entry is not None:
+                entry[1].write(chunk)
+                return
+            target = out if stream == 'stdout' else err
+            room = INLINE_BYTES - len(target)
+            if len(chunk) <= room:
+                target.extend(chunk)
+                return
+            os.makedirs(SPILL_DIR, exist_ok=True)
+            path = os.path.join(SPILL_DIR, '%s-%d-%d.txt' % (stream, os.getpid(), int(time.time() * 1000)))
+            handle = open(path, 'wb')
+            handle.write(bytes(target))
+            handle.write(chunk)
+            spills[stream] = (path, handle)
+            target.extend(chunk[:room])
+
+        idle_after_exit = None
         while True:
-            moved = False
-            if chan.recv_ready():
-                chunk = chan.recv(65536)
-                out_total += len(chunk)
-                if len(out) < INLINE_BYTES:
-                    out.extend(chunk[:INLINE_BYTES - len(out)])
-                moved = True
-            if chan.recv_stderr_ready():
-                chunk = chan.recv_stderr(65536)
-                err_total += len(chunk)
-                if len(err) < INLINE_BYTES:
-                    err.extend(chunk[:INLINE_BYTES - len(err)])
-                moved = True
-            if moved:
-                continue
-            if chan.exit_status_ready() and not chan.recv_ready() and not chan.recv_stderr_ready():
-                break
             if time.time() > deadline:
                 timed_out = True
                 try:
@@ -201,6 +206,25 @@ class Connection:
                 except Exception:
                     pass
                 break
+            moved = False
+            # 先把内核/paramiko 缓冲区里的数据全部读干净，避免单次读取后误判“没数据了”
+            while chan.recv_ready():
+                feed('stdout', chan.recv(65536))
+                moved = True
+            while chan.recv_stderr_ready():
+                feed('stderr', chan.recv_stderr(65536))
+                moved = True
+            if moved:
+                idle_after_exit = None
+                continue
+            if chan.exit_status_ready():
+                # 退出码就绪不代表输出读完：等服务端 EOF；个别服务端不发 EOF，则静默 1 秒后收工
+                if chan.eof_received:
+                    break
+                if idle_after_exit is None:
+                    idle_after_exit = time.time()
+                elif time.time() - idle_after_exit > 1.0:
+                    break
             time.sleep(0.02)
 
         exit_code = -1 if timed_out else chan.recv_exit_status()
@@ -209,17 +233,16 @@ class Connection:
             'exitCode': exit_code,
             'stdout': out.decode('utf-8', 'replace'),
             'stderr': err.decode('utf-8', 'replace'),
-            'stdoutBytes': out_total,
-            'stderrBytes': err_total,
+            'stdoutBytes': totals['stdout'],
+            'stderrBytes': totals['stderr'],
             'timedOut': timed_out,
         }
-        # 超出内联上限的部分落临时文件
-        if out_total > len(out):
-            os.makedirs(SPILL_DIR, exist_ok=True)
-            path = os.path.join(SPILL_DIR, 'stdout-%d.txt' % int(time.time() * 1000))
-            with open(path, 'wb') as handle:
-                handle.write(bytes(out))
-            result['stdoutSpillHint'] = path
+        # 超出内联上限时，完整内容在临时文件里，Node 侧直接引用该路径
+        for stream in ('stdout', 'stderr'):
+            entry = spills[stream]
+            if entry is not None:
+                entry[1].close()
+                result[stream + 'SpillPath'] = entry[0]
         return result
 
     # -- 传输 ------------------------------------------------------
@@ -247,7 +270,21 @@ class Connection:
         parent = os.path.dirname(os.path.abspath(local_path))
         if parent and not os.path.isdir(parent):
             os.makedirs(parent, exist_ok=True)
-        sftp.get(remote_path, local_path)
+        # 先下到临时文件再改名：失败时不留半截文件，也不会把下次重试卡在覆盖保护上
+        tmp_path = '%s.part-%d' % (local_path, os.getpid())
+        done = False
+        try:
+            sftp.get(remote_path, tmp_path)
+            done = True
+        except FileNotFoundError:
+            raise FileNotFoundError('远程文件不存在：%s' % remote_path)
+        finally:
+            if not done:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+        os.replace(tmp_path, local_path)
         self.last_used = time.time()
         return {'bytes': os.path.getsize(local_path), 'localPath': local_path}
 
@@ -342,6 +379,8 @@ def main():
             payload.update({'id': req_id, 'ok': True})
         except FileExistsError as error:
             payload = {'id': req_id, 'ok': False, 'error': str(error), 'code': 'EEXIST'}
+        except FileNotFoundError as error:
+            payload = {'id': req_id, 'ok': False, 'error': str(error), 'code': 'ENOENT'}
         except Exception as error:  # noqa: BLE001
             payload = {'id': req_id, 'ok': False, 'error': '%s: %s' % (type(error).__name__, error)}
         try:

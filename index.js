@@ -2,14 +2,12 @@
  * dsh-ssh-otp —— 带二次验证（TOTP）的 SSH 桥接插件（Host 半侧）。
  *
  * 设计要点：
- * - 工具注册走 ctx.tools.register(defineTool(...))；
+ * - 工具以标准 JSON Schema 注册到 ctx.tools.register；
  * - 密钥只在调用瞬间从宿主凭据库解析，通过 stdin 管道交给常驻的 Python 子进程，
  *   不写盘、不进日志、不进配置；
  * - SSH 由子进程里的 paramiko 负责（走 keyboard-interactive，能应答动态验证码），
  *   Node 侧只做协议编排、凭据解析与输出整形。
  */
-import { defineTool } from '@deepseek-ai/dsh-tools'
-import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -37,6 +35,19 @@ const DEFAULTS = {
   hosts: {},
 }
 
+/** 凭据名直通：名称合法性由宿主凭据库负责，插件不依赖 @deepseek-ai/dsh-credentials */
+const credentialRef = (name) => name
+
+/** 工具以标准 JSON Schema 注册；必填项在入口再兜底校验一次，错误信息面向调用者 */
+function requireArgs(args, keys) {
+  for (const key of keys) {
+    const value = args?.[key]
+    if (value === undefined || value === null || value === '') {
+      throw new Error(`缺少必填参数 ${key}`)
+    }
+  }
+}
+
 function loadConfig(logger) {
   if (!existsSync(CONFIG_FILE)) {
     return { ...DEFAULTS, hosts: {} }
@@ -50,9 +61,20 @@ function loadConfig(logger) {
   }
 }
 
-/** 输出整形：小结果内联，大结果落盘并明确告知截断事实 */
-function shapeStream(text, label) {
-  const bytes = Buffer.byteLength(text ?? '', 'utf8')
+/** 输出整形：小结果内联；大结果落盘并明确告知截断事实。
+ *  Python 侧超过自己的内联上限时会把完整内容写进临时文件，这里沿用它给的路径，
+ *  避免"声称给了完整输出、实际只有前 512 KiB"的假承诺。 */
+function shapeStream(text, label, spillFromService, totalBytes) {
+  const bytes = typeof totalBytes === 'number' ? totalBytes : Buffer.byteLength(text ?? '', 'utf8')
+  if (spillFromService) {
+    const head = (text ?? '').slice(0, INLINE_HEAD_CHARS)
+    return {
+      text: `${head}\n…[output truncated: ${bytes} bytes total, full output at ${spillFromService}]`,
+      truncated: true,
+      bytes,
+      spillPath: spillFromService,
+    }
+  }
   if (bytes <= INLINE_MAX_BYTES) {
     return { text: text ?? '', truncated: false, bytes }
   }
@@ -245,7 +267,7 @@ export function apply(ctx, _config) {
         passwordRef: auth.passwordRef ?? null,
         totpRef: auth.totpRef ?? null,
         passwordReady: await check(auth.passwordRef),
-        totpReady: (auth.kind ?? 'password') === 'password_totp' ? await check(auth.totpRef) : true,
+        totpReady: (auth.kind ?? 'password') === 'password_totp' ? await check(auth.totpRef) : false,
       })
     }
     return rows
@@ -390,27 +412,32 @@ export function apply(ctx, _config) {
 
   const tools = []
 
-  tools.push(defineTool({
+  tools.push({
     name: 'ssh_otp_hosts',
     description: '列出本插件配置的 SSH 主机，以及它们的密码/二次验证凭据是否已在宿主凭据库中就位。',
-    parameters: {},
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {},
+    },
     output: {
       schema: {
         type: 'object',
         additionalProperties: false,
+        required: ['hosts'],
         properties: {
           hosts: {
             type: 'array',
-            required: true,
             items: {
               type: 'object',
               additionalProperties: false,
+              required: ['alias', 'target', 'authKind', 'passwordReady', 'totpReady'],
               properties: {
-                alias: { type: 'string', required: true },
-                target: { type: 'string', required: true },
-                authKind: { type: 'string', required: true },
-                passwordReady: { type: 'boolean', required: true },
-                totpReady: { type: 'boolean', required: true },
+                alias: { type: 'string' },
+                target: { type: 'string' },
+                authKind: { type: 'string' },
+                passwordReady: { type: 'boolean' },
+                totpReady: { type: 'boolean' },
               },
             },
           },
@@ -438,25 +465,31 @@ export function apply(ctx, _config) {
         })),
       }
     },
-  }))
+  })
 
-  tools.push(defineTool({
+  tools.push({
     name: 'ssh_otp_exec',
     description: '在远程主机上执行一条 shell 命令并返回 exit code、stdout、stderr。认证用密码 + 本地生成的 TOTP 验证码（适用于开启二次验证、且禁用了公钥认证的集群）。',
     parameters: {
-      host: { type: 'string', required: true, description: '主机别名（见 ssh_otp_hosts）' },
-      command: { type: 'string', required: true, description: '远程 shell 命令；多条命令用 ; 或 && 连接，减少连接轮次' },
+      type: 'object',
+      additionalProperties: false,
+      required: ['host', 'command'],
+      properties: {
+      host: { type: 'string', description: '主机别名（见 ssh_otp_hosts）' },
+      command: { type: 'string', description: '远程 shell 命令；多条命令用 ; 或 && 连接，减少连接轮次' },
       timeoutMs: { type: 'integer', description: '执行超时（毫秒），默认取插件配置，通常 120000' },
+      },
     },
     output: {
       schema: {
         type: 'object',
         additionalProperties: false,
+        required: ['exitCode', 'stdout', 'stderr', 'truncated'],
         properties: {
-          exitCode: { type: 'integer', required: true },
-          stdout: { type: 'string', required: true },
-          stderr: { type: 'string', required: true },
-          truncated: { type: 'boolean', required: true },
+          exitCode: { type: 'integer' },
+          stdout: { type: 'string' },
+          stderr: { type: 'string' },
+          truncated: { type: 'boolean' },
           spillPath: { type: 'string' },
           bytesTotal: { type: 'integer' },
           timedOut: { type: 'boolean' },
@@ -472,6 +505,7 @@ export function apply(ctx, _config) {
     },
     isConcurrencySafe: () => false,
     async execute(args, exec) {
+      requireArgs(args, ['host', 'command'])
       const { conn, timeoutMs } = await resolveConn(args.host)
       const payload = await bridge.request({
         op: 'exec',
@@ -481,8 +515,8 @@ export function apply(ctx, _config) {
         timeoutMs: args.timeoutMs ?? timeoutMs,
       })
       if (exec?.signal?.aborted) throw new Error('调用已取消；远程命令可能仍在运行')
-      const out = shapeStream(payload.stdout, `${args.host}-stdout`)
-      const err = shapeStream(payload.stderr, `${args.host}-stderr`)
+      const out = shapeStream(payload.stdout, `${args.host}-stdout`, payload.stdoutSpillPath, payload.stdoutBytes)
+      const err = shapeStream(payload.stderr, `${args.host}-stderr`, payload.stderrSpillPath, payload.stderrBytes)
       const result = {
         exitCode: typeof payload.exitCode === 'number' ? payload.exitCode : -1,
         stdout: out.text,
@@ -495,30 +529,37 @@ export function apply(ctx, _config) {
       if (typeof payload.stdoutBytes === 'number') result.bytesTotal = payload.stdoutBytes
       return result
     },
-  }))
+  })
 
-  tools.push(defineTool({
+  tools.push({
     name: 'ssh_otp_upload',
     description: '把本机文件上传到远程主机（SFTP）。默认不覆盖远程同名文件，需要覆盖时显式传 overwrite=true。',
     parameters: {
-      host: { type: 'string', required: true, description: '主机别名' },
-      localPath: { type: 'string', required: true, description: '本机文件路径（建议用绝对路径）' },
-      remotePath: { type: 'string', required: true, description: '远程目标路径（文件，不是目录）' },
+      type: 'object',
+      additionalProperties: false,
+      required: ['host', 'localPath', 'remotePath'],
+      properties: {
+      host: { type: 'string', description: '主机别名' },
+      localPath: { type: 'string', description: '本机文件路径（建议用绝对路径）' },
+      remotePath: { type: 'string', description: '远程目标路径（文件，不是目录）' },
       overwrite: { type: 'boolean', description: '远程已存在时是否覆盖，默认 false' },
+      },
     },
     output: {
       schema: {
         type: 'object',
         additionalProperties: false,
+        required: ['bytes', 'remotePath'],
         properties: {
-          bytes: { type: 'integer', required: true },
-          remotePath: { type: 'string', required: true },
+          bytes: { type: 'integer' },
+          remotePath: { type: 'string' },
         },
       },
       render: (_args, value) => [{ type: 'text', text: `已上传 ${value.bytes} 字节 → ${value.remotePath}` }],
     },
     isConcurrencySafe: () => false,
     async execute(args) {
+      requireArgs(args, ['host', 'localPath', 'remotePath'])
       const local = resolveLocalPath(args.localPath)
       if (!existsSync(local)) throw new Error(`本机文件不存在：${local}`)
       const { conn } = await resolveConn(args.host)
@@ -532,30 +573,37 @@ export function apply(ctx, _config) {
       })
       return { bytes: payload.bytes, remotePath: payload.remotePath }
     },
-  }))
+  })
 
-  tools.push(defineTool({
+  tools.push({
     name: 'ssh_otp_download',
     description: '把远程主机的文件下载到本机（SFTP）。默认不覆盖本机同名文件，需要覆盖时显式传 overwrite=true。',
     parameters: {
-      host: { type: 'string', required: true, description: '主机别名' },
-      remotePath: { type: 'string', required: true, description: '远程文件路径' },
-      localPath: { type: 'string', required: true, description: '本机目标路径（建议用绝对路径；父目录会自动创建）' },
+      type: 'object',
+      additionalProperties: false,
+      required: ['host', 'remotePath', 'localPath'],
+      properties: {
+      host: { type: 'string', description: '主机别名' },
+      remotePath: { type: 'string', description: '远程文件路径' },
+      localPath: { type: 'string', description: '本机目标路径（建议用绝对路径；父目录会自动创建）' },
       overwrite: { type: 'boolean', description: '本机已存在时是否覆盖，默认 false' },
+      },
     },
     output: {
       schema: {
         type: 'object',
         additionalProperties: false,
+        required: ['bytes', 'localPath'],
         properties: {
-          bytes: { type: 'integer', required: true },
-          localPath: { type: 'string', required: true },
+          bytes: { type: 'integer' },
+          localPath: { type: 'string' },
         },
       },
       render: (_args, value) => [{ type: 'text', text: `已下载 ${value.bytes} 字节 → ${value.localPath}` }],
     },
     isConcurrencySafe: () => false,
     async execute(args) {
+      requireArgs(args, ['host', 'remotePath', 'localPath'])
       const local = resolveLocalPath(args.localPath)
       const { conn } = await resolveConn(args.host)
       const payload = await bridge.request({
@@ -568,7 +616,7 @@ export function apply(ctx, _config) {
       })
       return { bytes: payload.bytes, localPath: payload.localPath }
     },
-  }))
+  })
 
   ctx.effect(() => {
     const disposers = tools.map((tool) => ctx.tools.register(tool))

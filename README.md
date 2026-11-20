@@ -21,7 +21,7 @@ Behaviour worth knowing:
 
 - **One long-lived connection per host.** Commands on the same host are serialized; different hosts run in parallel. Connections idle out after 10 minutes (configurable).
 - **Replay protection handled.** TOTP codes are single-use on most servers. If authentication is rejected, the service waits for the next 30-second window and retries exactly once.
-- **Output is bounded honestly.** Anything over 64 KiB is written to `~/.dsh/ssh-otp-spill/` and the result reports `truncated: true` plus the file path — no silent data loss.
+- **Output is bounded honestly.** Anything over 64 KiB is spilled to disk and the result reports `truncated: true` plus a path holding the complete stream (`~/.dsh/ssh-otp-spill/`, or the service temp spool for very large streams). Earlier builds could stop reading while a fast producer was still writing; the read loop now waits for channel EOF before it reports totals.
 - **Secrets never touch disk here.** They are read from the DSH credential store at call time and handed to the Python child process over its stdin pipe.
 
 ## Architecture
@@ -144,7 +144,8 @@ If the seed leaks, rotate it on the server (for a typical Google-Authenticator s
 ## Limitations
 
 - **No TTY.** `ssh_otp_exec` runs commands without a pseudo-terminal, so `top`, `vi`, and interactive `salloc` shells do not work. Use a normal terminal client for those.
-- Commands on one host are serialized by design.
+- **No login shell.** Commands run through the server's non-login shell, so an interactive `~/.bashrc` is not sourced and site module environments may be absent (for example `nvidia-smi` can be missing from `PATH`); call tools by absolute path or `source` the environment explicitly.
+- **A timeout stops waiting, not the remote process.** `timeoutMs` returns `timedOut: true` and closes the channel; a long build or `sleep` may keep running on the server. Commands on one host are serialized by design.
 - The TOTP path assumes 6 digits / 30 seconds / SHA-1 (Google Authenticator defaults).
 - Windows is the primary target (the plugin was developed there); the Python service is platform-neutral.
 - Verified against OpenSSH 7.4 with `keyboard-interactive` split across two prompt rounds. Servers that ask more rounds, or that combine prompts, should still work — the handler answers per prompt, not per round.
