@@ -21,3 +21,8 @@ Thumbs.db
 # Python 缓存
 __pycache__/
 *.pyc
+
+# MCP 本地配置与凭据（只提交 examples，不提交真实文件）
+.ssh-otp/
+secrets.json
+*.local.json

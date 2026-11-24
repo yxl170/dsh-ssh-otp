@@ -1,0 +1,25 @@
+{
+  "timeoutMs": 120000,
+  "retryOnAuthFailure": false,
+  "hosts": {
+    "cluster-a": {
+      "host": "cluster.example.org",
+      "port": 22,
+      "user": "your-username",
+      "auth": {
+        "kind": "password_totp",
+        "passwordRef": "CLUSTER_A_SSH_PASSWORD",
+        "totpRef": "CLUSTER_A_TOTP_SEED"
+      }
+    },
+    "cluster-b": {
+      "host": "10.0.0.10",
+      "port": 22,
+      "user": "your-username",
+      "auth": {
+        "kind": "password",
+        "passwordRef": "CLUSTER_B_SSH_PASSWORD"
+      }
+    }
+  }
+}

@@ -22,7 +22,11 @@ Behaviour worth knowing:
 - **One long-lived connection per host.** Commands on the same host are serialized; different hosts run in parallel. Connections idle out after 10 minutes (configurable).
 - **No automatic auth retry.** A rejected login is reported after exactly one attempt, because most failures are a wrong username or password and a retry only doubles the fail2ban counter. Set `"retryOnAuthFailure": true` in `~/.dsh/dsh-ssh-otp.json` if you really want one extra attempt in the next TOTP window (only when a code prompt was involved). Two consecutive failures make the plugin stop connecting for 10 minutes instead of hammering the server.
 - **Output is bounded honestly.** Anything over 64 KiB is spilled to disk and the result reports `truncated: true` plus a path holding the complete stream (`~/.dsh/ssh-otp-spill/`, or the service temp spool for very large streams). Earlier builds could stop reading while a fast producer was still writing; the read loop now waits for channel EOF before it reports totals.
-- **Secrets never touch disk here.** They are read from the DSH credential store at call time and handed to the Python child process over its stdin pipe.
+- **Secrets never touch disk here.** In the DSH plugin they are read from the DSH credential store at call time and handed to the Python child process over its stdin pipe. The standalone MCP mode instead uses a permission-restricted local `~/.ssh-otp/secrets.json`.
+
+## Antigravity / MCP
+
+A standalone MCP stdio server lives in [`mcp/`](mcp/). It exposes the same four SSH tools plus `ssh_otp_doctor`, and works without DSH or Node. It reuses the same paramiko connection implementation, keeps the single-attempt and fail2ban-breaker behaviour, and reads hosts from `~/.ssh-otp/config.json` and secrets from `~/.ssh-otp/secrets.json`. See the [MCP setup guide](mcp/README.md) for the install script and the Antigravity `mcp_config.json` snippet. The DSH plugin and MCP entry are versioned independently.
 
 ## Architecture
 
@@ -202,5 +206,7 @@ MIT
 这个插件给 DSH 加上能**自动完成「密码 + 动态验证码」二次验证登录**的 SSH 工具，用于那些禁用了公钥认证、每次连接都要求 `keyboard-interactive` 验证码的集群。
 
 提供 `ssh_otp_hosts` / `ssh_otp_exec` / `ssh_otp_upload` / `ssh_otp_download` 四个工具，外加一个设置页：增删改主机、录入密钥、测试连接、修改默认超时（解释器与服务脚本路径只读）。
+
+另附独立的 [Antigravity / MCP stdio 入口](mcp/README.md)：不依赖 DSH，复用同一 SSH 核心，提供上述四个工具及 `ssh_otp_doctor`，主机与 secrets 使用 `~/.ssh-otp/` 下的独立配置。
 
 **安全前提必须清楚**：把密码和 TOTP 种子都存在同一台机器上，等于把双因子降成单因子。种子就是母本，谁拿到它就能一直生成有效验证码。插件能做的是"不再把明文写进配置、日志和报错里"，做不到"泄露后仍然安全"。种子一旦外泄，请立刻在服务器上重置二次验证密钥。

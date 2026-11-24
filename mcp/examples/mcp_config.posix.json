@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "ssh-otp": {
+      "command": "/home/you/.ssh-otp/venv/bin/python",
+      "args": ["/home/you/src/dsh-ssh-otp/mcp/ssh_otp_mcp.py"],
+      "env": {
+        "SSH_OTP_CONFIG": "/home/you/.ssh-otp/config.json",
+        "SSH_OTP_SECRETS": "/home/you/.ssh-otp/secrets.json"
+      }
+    }
+  }
+}
